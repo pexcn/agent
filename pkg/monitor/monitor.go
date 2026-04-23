@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -68,38 +69,67 @@ var (
 	stateLock        sync.Mutex
 )
 
-func readCgroupV2Memory() (used uint64, total uint64, ok bool) {
-	currentBytes, err := os.ReadFile("/sys/fs/cgroup/memory.current")
+func currentCgroupV2Dir() string {
+	const cgroupRoot = "/sys/fs/cgroup"
+
+	data, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
-		return 0, 0, false
+		return cgroupRoot
 	}
 
-	maxBytes, err := os.ReadFile("/sys/fs/cgroup/memory.max")
-	if err != nil {
-		return 0, 0, false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 || parts[0] != "0" || parts[1] != "" {
+			continue
+		}
+
+		cgroupPath := strings.TrimSpace(parts[2])
+		if cgroupPath == "" || cgroupPath == "/" {
+			return cgroupRoot
+		}
+
+		cleaned := filepath.Clean("/" + cgroupPath)
+		if cleaned == "/" {
+			return cgroupRoot
+		}
+
+		return filepath.Join(cgroupRoot, strings.TrimPrefix(cleaned, "/"))
 	}
 
-	currentStr := strings.TrimSpace(string(currentBytes))
-	maxStr := strings.TrimSpace(string(maxBytes))
-	if currentStr == "" || maxStr == "" || maxStr == "max" {
-		return 0, 0, false
+	return cgroupRoot
+}
+
+func readCgroupV2Memory() (used uint64, usedOK bool, total uint64, totalOK bool) {
+	cgroupDir := currentCgroupV2Dir()
+
+	currentBytes, err := os.ReadFile(filepath.Join(cgroupDir, "memory.current"))
+	if err == nil {
+		currentStr := strings.TrimSpace(string(currentBytes))
+		if currentStr != "" {
+			used, err = strconv.ParseUint(currentStr, 10, 64)
+			usedOK = err == nil
+		}
 	}
 
-	used, err = strconv.ParseUint(currentStr, 10, 64)
-	if err != nil {
-		return 0, 0, false
+	maxBytes, err := os.ReadFile(filepath.Join(cgroupDir, "memory.max"))
+	if err == nil {
+		maxStr := strings.TrimSpace(string(maxBytes))
+		if maxStr != "" && maxStr != "max" {
+			total, err = strconv.ParseUint(maxStr, 10, 64)
+			totalOK = err == nil && total > 0
+		}
 	}
 
-	total, err = strconv.ParseUint(maxStr, 10, 64)
-	if err != nil || total == 0 {
-		return 0, 0, false
-	}
-
-	if used > total {
+	if usedOK && totalOK && used > total {
 		used = total
 	}
 
-	return used, total, true
+	return used, usedOK, total, totalOK
 }
 
 func InitConfig(cfg *model.AgentConfig) {
@@ -146,7 +176,7 @@ func GetHost() *model.Host {
 		if runtime.GOOS != "windows" {
 			ret.SwapTotal = mv.SwapTotal
 		}
-		if _, cgTotal, ok := readCgroupV2Memory(); ok {
+		if _, _, cgTotal, totalOK := readCgroupV2Memory(); totalOK {
 			ret.MemTotal = cgTotal
 		}
 	}
@@ -177,14 +207,11 @@ func GetState(skipConnectionCount bool, skipProcsCount bool) *model.HostState {
 	if err != nil {
 		printf("mem.VirtualMemory error: %v", err)
 	} else {
+		ret.MemUsed = util.SubUintChecked(vm.Total, vm.Available)
 		if vm.Available > vm.Total {
-			if cgUsed, _, ok := readCgroupV2Memory(); ok {
+			if cgUsed, usedOK, _, _ := readCgroupV2Memory(); usedOK {
 				ret.MemUsed = cgUsed
-			} else {
-				ret.MemUsed = util.SubUintChecked(vm.Total, vm.Available)
 			}
-		} else {
-			ret.MemUsed = util.SubUintChecked(vm.Total, vm.Available)
 		}
 		if runtime.GOOS != "windows" {
 			ret.SwapUsed = util.SubUintChecked(vm.SwapTotal, vm.SwapFree)
